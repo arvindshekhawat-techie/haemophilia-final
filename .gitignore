@@ -1,15 +1,21 @@
-venv/
-venv310/
+# Python
 __pycache__/
 *.pyc
+*.pyo
 
+# Virtual env
+venv/
+venv310/
+
+# Dataset / heavy files
 dataset/
-debug/
 processed_debug/
-
+debug/
 *.mp4
 *.avi
+*.mov
 *.npy
 
-# optional (recommended)
-*.pth
+# OS
+.DS_Store
+Thumbs.db
