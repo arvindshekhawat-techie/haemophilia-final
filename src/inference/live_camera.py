@@ -10,7 +10,6 @@ import numpy as np
 from src.features.elbow_features import build_features
 from src.inference.inference import ElbowInference
 from src.pose.pose_extraction import extract_frame_landmarks
-from src.training.dataset import SEQUENCE_LENGTH
 
 
 # ================== TUNING ==================
@@ -31,10 +30,6 @@ DOWN_TRIGGER_OFFSET = 12
 
 class LiveRepTracker:
     def __init__(self):
-        self.angle_series = deque(maxlen=SEQUENCE_LENGTH)
-        self.rows = deque(maxlen=SEQUENCE_LENGTH)
-        self.sequence = deque(maxlen=SEQUENCE_LENGTH)
-
         self.ema_angle = None
         self.last_angle = None
         self.prev_angle = None
@@ -56,14 +51,10 @@ class LiveRepTracker:
         self.rep_frames = 0
         self.cooldown = 0
 
+        self.rep_rows = []
         self.rep_angles = []
-        self.rep_velocities = []
-
-        self.last_prob = 0.5
 
         self.form = "WAITING"
-        self.last_rep_score = None
-        self.last_rep_status = "WAITING"
 
     def smooth_angle(self, shoulder, elbow, wrist):
         a, b, c = np.array(shoulder), np.array(elbow), np.array(wrist)
@@ -103,9 +94,6 @@ class LiveRepTracker:
 
         angle = self.smooth_angle(shoulder, elbow, wrist)
 
-        self.angle_series.append(angle)
-        self.rows.append(row)
-
         if self.prev_angle is not None:
             if angle < self.prev_angle:
                 self.direction_buffer.append("UP")
@@ -137,23 +125,13 @@ class LiveRepTracker:
 
             return self.result()
 
-        # ===== FEATURES =====
-        features, _ = build_features(
-            list(self.rows),
-            30,
-            angle_series=np.array(self.angle_series, dtype=np.float32),
-        )
-
-        self.sequence.append(features[-1])
-        velocity = float(features[-1][1])
-
         # ===== STATE MACHINE (UNCHANGED) =====
         if self.direction == "UP" and angle < self.up_trigger:
             if self.state != "UP":
                 self.state = "UP"
                 self.rep_frames = 0
+                self.rep_rows = []
                 self.rep_angles = []
-                self.rep_velocities = []
 
         elif self.direction == "DOWN" and angle > self.down_trigger:
 
@@ -161,36 +139,28 @@ class LiveRepTracker:
 
                 self.rep_count += 1
 
-                rom = max(self.rep_angles) - min(self.rep_angles)
-                min_angle_reached = min(self.rep_angles) if self.rep_angles else angle
+                self.rep_rows.append(row)
+                self.rep_angles.append(angle)
 
-                full_range = max(self.max_angle - self.min_angle, 1e-6)
-                ratio = rom / full_range
-
-                avg_speed = np.mean(self.rep_velocities) if self.rep_velocities else 0
-
-                # ================= 🔥 NEW FORM LOGIC =================
-                if 100 <= min_angle_reached <= 117:
-                    self.form = "Correct"
+                if predictor is None:
+                    self.form = "Uncertain"
                 else:
-                    self.form = "Incorrect"
-
-                # fallback (rare case)
-                if 95 < min_angle_reached < 122:
-                    if ratio < 0.25:
-                        self.form = "Incorrect"
-                # ====================================================
-
-                # ===== SCORE (UNCHANGED) =====
-                score = self.score_rep(ratio, avg_speed)
-                self.last_rep_score = score
-
-                if score > 80:
-                    self.last_rep_status = "EXCELLENT"
-                elif score > 60:
-                    self.last_rep_status = "GOOD"
-                else:
-                    self.last_rep_status = "BAD"
+                    features, _ = build_features(
+                        self.rep_rows,
+                        30,
+                        angle_series=np.asarray(self.rep_angles, dtype=np.float32),
+                        feature_schema_version=(
+                            predictor.feature_schema_version
+                            if predictor
+                            else 2
+                        ),
+                    )
+                    prediction, _ = predictor.predict(features)
+                    self.form = {
+                        "CORRECT": "Correct",
+                        "INCORRECT": "Incorrect",
+                        "UNCERTAIN": "Uncertain",
+                    }[prediction]
 
                 self.cooldown = REP_COOLDOWN
 
@@ -201,35 +171,10 @@ class LiveRepTracker:
 
         if self.state == "UP":
             self.rep_frames += 1
+            self.rep_rows.append(row)
             self.rep_angles.append(angle)
-            self.rep_velocities.append(abs(velocity))
-
-        if predictor and len(self.sequence) == SEQUENCE_LENGTH:
-            _, prob = predictor.predict_probability(np.array(self.sequence, dtype=np.float32))
-            self.last_prob = prob
 
         return self.result()
-
-    def score_rep(self, ratio, speed):
-        score = 0
-
-        if ratio >= 0.75:
-            score += 60
-        elif ratio >= 0.6:
-            score += 50
-        elif ratio >= 0.45:
-            score += 35
-        else:
-            score += 20
-
-        if speed < 0.05:
-            score += 30
-        elif speed < 0.08:
-            score += 20
-        else:
-            score += 10
-
-        return min(score, 100)
 
     def result(self):
         return {
@@ -237,8 +182,6 @@ class LiveRepTracker:
             "reps": self.rep_count,
             "form": self.form,
             "angle": self.last_angle or 0,
-            "rep_score": self.last_rep_score,
-            "rep_status": self.last_rep_status,
         }
 
 
@@ -275,9 +218,9 @@ def run_live_camera(model_path):
 
 
 def _draw(frame, r):
-    if r["form"] == "Correct":
+    if r["form"] in ("Correct", "CORRECT"):
         color = (0, 255, 0)
-    elif r["form"] == "Incorrect":
+    elif r["form"] in ("Incorrect", "INCORRECT"):
         color = (0, 0, 255)
     else:
         color = (0, 255, 255)
@@ -286,9 +229,15 @@ def _draw(frame, r):
     cv2.putText(frame, f"Form: {r['form']}", (20, 70), 0, 0.7, color, 2)
     cv2.putText(frame, f"Angle: {r['angle']:.1f}", (20, 100), 0, 0.7, (255,255,255), 2)
     cv2.putText(frame, f"State: {r['state']}", (20, 130), 0, 0.7, (255,255,255), 2)
-
-    if r["rep_status"] != "WAITING":
-        cv2.putText(frame, f"{r['rep_status']} ({r['rep_score']})", (20, 200), 0, 0.8, (0,255,255), 2)
+    cv2.putText(
+        frame,
+        "EXPERIMENTAL - NOT FOR MEDICAL USE",
+        (20, 180),
+        0,
+        0.6,
+        (0, 165, 255),
+        2,
+    )
 
 
 def _p(row, i):
@@ -300,4 +249,4 @@ def _p(row, i):
 
 
 if __name__ == "__main__":
-    run_live_camera(Path(__file__).resolve().parents[2] / "models" / "elbow_flexion_lstm.pth")
+    run_live_camera(Path(__file__).resolve().parents[2] / "models" / "elbow_lstm.pth")

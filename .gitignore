@@ -1,7 +1,15 @@
 venv/
+venv310/
 __pycache__/
 *.pyc
-*.npy
-processed/
-processed_clean/
+
 dataset/
+debug/
+processed_debug/
+
+*.mp4
+*.avi
+*.npy
+
+# optional (recommended)
+*.pth

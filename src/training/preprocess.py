@@ -1,205 +1,166 @@
+"""
+Robust preprocessing (FINAL FIXED)
+
+✔ Detects reps reliably
+✔ Does NOT over-filter
+✔ Gives debug output
+✔ Saves usable data
+"""
+
+from math import ceil
 from pathlib import Path
 import numpy as np
 
 from src.pose.pose_extraction import extract_video_landmarks, video_fps
-from src.features.elbow_features import build_features
-from src.training.dataset import SEQUENCE_LENGTH, INPUT_SIZE
+from src.features.elbow_features import (
+    build_features,
+    elbow_angle,
+    filter_angle_outliers,
+    smooth_angles,
+    FEATURE_SCHEMA_VERSION,
+)
+from src.exercises.elbow_flexion import detect_rep_boundaries
 
 
-# ==============================
-# RESIZE TO FIXED LENGTH
-# ==============================
-def _resize_sequence(features):
-    if len(features) == 0:
-        return np.zeros((SEQUENCE_LENGTH, INPUT_SIZE), dtype=np.float32)
+# ============================
+# CONFIG (VERY IMPORTANT)
+# ============================
+TARGET_FPS = 15.0
 
-    if len(features) < SEQUENCE_LENGTH:
-        pad = np.repeat(features[-1:], SEQUENCE_LENGTH - len(features), axis=0)
-        return np.vstack((features, pad)).astype(np.float32)
-
-    if len(features) > SEQUENCE_LENGTH:
-        idx = np.linspace(0, len(features) - 1, SEQUENCE_LENGTH).astype(int)
-        return features[idx].astype(np.float32)
-
-    return features.astype(np.float32)
+MIN_ROM = 8              # 🔥 VERY RELAXED
+MIN_FRAMES = 6           # 🔥 VERY RELAXED
+MAX_VISIBILITY_DROP = 0.7  # 🔥 VERY RELAXED
 
 
-# ==============================
-# ANGLE FUNCTION
-# ==============================
-def elbow_angle(row):
-    a = np.array([row[f"landmark_12_{x}"] for x in ("x", "y", "z")])
-    b = np.array([row[f"landmark_14_{x}"] for x in ("x", "y", "z")])
-    c = np.array([row[f"landmark_16_{x}"] for x in ("x", "y", "z")])
-
-    ba = a - b
-    bc = c - b
-
-    angle = np.degrees(
-        np.arccos(
-            np.clip(
-                np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6),
-                -1, 1
-            )
-        )
-    )
-
-    return float(np.clip(angle, 40, 170))
-
-
-# ==============================
-# 🔥 NEW ROBUST REP DETECTOR
-# ==============================
-def detect_reps(angles_smooth):
-    boundaries = []
-
-    start = 0
-    n = len(angles_smooth)
-
-    while start < n - 20:
-        # find local min (flexed)
-        search_window = angles_smooth[start: min(start + 120, n)]
-        if len(search_window) < 10:
-            break
-
-        min_idx = start + np.argmin(search_window)
-
-        # find next max after min
-        search_end = min(min_idx + 120, n)
-        max_idx = min_idx + np.argmax(angles_smooth[min_idx:search_end])
-
-        start_angle = angles_smooth[start]
-        mid_angle = angles_smooth[min_idx]
-        end_angle = angles_smooth[max_idx]
-
-        # 🔥 VALIDATION (tune here if needed)
-        if (
-            start_angle > 120 and
-            mid_angle < 120 and
-            end_angle > 120 and
-            (start_angle - mid_angle) > 20 and
-            (end_angle - mid_angle) > 20 and
-            (max_idx - start) > 10   # avoid tiny reps
-        ):
-            boundaries.append((start, max_idx, min_idx))
-
-            # jump forward → avoid duplicate detection
-            start = max_idx
-        else:
-            start += 10  # slide window
-
-    return boundaries
-
-
-# ==============================
-# MAIN PREPROCESS (FIXED)
-# ==============================
+# ============================
 def preprocess_dataset(dataset_dir, processed_dir):
     dataset_dir = Path(dataset_dir)
     processed_dir = Path(processed_dir)
 
     if processed_dir.exists():
-        for f in processed_dir.rglob("*.npy"):
-            f.unlink()
+        print("❌ Delete processed folder first")
+        return
 
-    for class_name in ["correct", "incorrect"]:
-        class_dir = dataset_dir / class_name
-        if not class_dir.exists():
-            continue
+    for class_name, label in [("correct", 1), ("incorrect", 0)]:
 
-        label = 1 if class_name == "correct" else 0
-
+        class_path = dataset_dir / class_name
         save_dir = processed_dir / class_name
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        for video_path in class_dir.glob("*.mp4"):
-            print(f"\nProcessing: {video_path.name}")
+        videos = sorted(class_path.glob("*.mp4"))
 
-            rows = extract_video_landmarks(video_path)
-            angles = np.array([elbow_angle(r) for r in rows], dtype=np.float32)
+        for video_path in videos:
+            print(f"\n🎥 Processing: {video_path.name}")
 
-            # smooth
-            angles_smooth = np.convolve(angles, np.ones(5)/5, mode='same')
+            fps_original = video_fps(video_path)
+            stride = max(1, ceil(fps_original / TARGET_FPS))
 
-            fps = video_fps(video_path)
+            rows = extract_video_landmarks(video_path, frame_stride=stride)
 
-            # -----------------------------
-            # 🔥 NEW RANGE-BASED REP DETECTION
-            # -----------------------------
-            boundaries = []
-            start = 0
-            n = len(angles_smooth)
+            if not rows:
+                print("❌ No landmarks")
+                continue
 
-            while start < n - 20:
-                window = angles_smooth[start:start+150]
+            fps = fps_original / stride
 
-                if len(window) < 20:
-                    break
+            # -------------------------
+            # ANGLES
+            # -------------------------
+            raw_angles = np.array([elbow_angle(r) for r in rows], dtype=np.float32)
+            angles = smooth_angles(filter_angle_outliers(raw_angles))
 
-                min_idx = start + np.argmin(window)
-                max_idx = min_idx + np.argmax(angles_smooth[min_idx:min(min_idx+150, n)])
+            print(f"Angle range: {angles.min():.2f} → {angles.max():.2f}")
 
-                start_angle = angles_smooth[start]
-                mid_angle = angles_smooth[min_idx]
-                end_angle = angles_smooth[max_idx]
-
-                range_motion = start_angle - mid_angle
-
-                # -----------------------------
-                # 🔥 QUALITY FILTER (NOT LABEL BASED)
-                # -----------------------------
-                if (
-                    start_angle > 120 and
-                    mid_angle < 130 and
-                    end_angle > 120 and
-                    range_motion > 15 and
-                    (max_idx - start) > int(fps * 0.5)
-                ):
-                    boundaries.append((start, max_idx, min_idx))
-                    start = max_idx
-                else:
-                    start += 10
+            # -------------------------
+            # DETECT REPS
+            # -------------------------
+            boundaries = detect_rep_boundaries(angles, fps=fps)
 
             print(f"Detected reps: {len(boundaries)}")
 
-            # -----------------------------
-            # SAVE REPS
-            # -----------------------------
-            for i, (start, end, mid) in enumerate(boundaries):
-                rep_rows = rows[start:end]
-                rep_angles = angles_smooth[start:end]
+            rep_count = 0
 
-                # 🔥 EXTRA METADATA FOR MODEL LEARNING
-                range_motion = np.max(rep_angles) - np.min(rep_angles)
-                duration = len(rep_angles) / fps
-                peak = np.max(rep_angles)
+            for i, (start, end) in enumerate(boundaries):
 
-                # 🚨 IMPORTANT: mild filtering (NOT aggressive)
-                if range_motion < 10:
+                rep_rows = rows[start:end + 1]
+                rep_angles = angles[start:end + 1]
+
+                print(f"\n--- REP {i+1} ---")
+
+                # -------------------------
+                # VISIBILITY
+                # -------------------------
+                bad_frames = sum(
+                    any(
+                        row.get(f"landmark_{j}_visibility", 0) < 0.5
+                        for j in [12, 14, 16]
+                    )
+                    for row in rep_rows
+                )
+
+                visibility_ratio = bad_frames / max(len(rep_rows), 1)
+                print(f"Visibility: {visibility_ratio:.2f}")
+
+                if visibility_ratio > MAX_VISIBILITY_DROP:
+                    print("❌ Skipped: visibility")
                     continue
 
-                features, _ = build_features(rep_rows, fps, rep_angles)
-                sequence = _resize_sequence(features)
+                # -------------------------
+                # RANGE OF MOTION
+                # -------------------------
+                rom = float(np.ptp(rep_angles))
+                print(f"ROM: {rom:.2f}")
 
-                save_path = save_dir / f"{video_path.stem}_rep{i}.npy"
+                if rom < MIN_ROM:
+                    print("❌ Skipped: low ROM")
+                    continue
 
-                np.save(save_path, {
-                    "features": sequence,
-                    "label": label,
-                    "range": range_motion,
-                    "duration": duration,
-                    "peak": peak
-                })
+                # -------------------------
+                # LENGTH
+                # -------------------------
+                print(f"Frames: {len(rep_angles)}")
 
-                print(f"Saved rep {i+1}")
+                if len(rep_angles) < MIN_FRAMES:
+                    print("❌ Skipped: too short")
+                    continue
 
-# ==============================
-# RUN
-# ==============================
+                # -------------------------
+                # BUILD FEATURES
+                # -------------------------
+                features, _ = build_features(
+                    rep_rows,
+                    fps,
+                    angle_series=rep_angles,
+                )
+
+                # -------------------------
+                # SAVE
+                # -------------------------
+                save_path = save_dir / f"{video_path.stem}_rep{rep_count}.npy"
+
+                np.save(
+                    save_path,
+                    {
+                        "features": features,
+                        "label": label,
+                        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                        "range": rom,
+                        "duration": float(len(rep_angles) / fps),
+                        "peak": float(np.max(rep_angles)),
+                    }
+                )
+
+                print("✅ Saved")
+                rep_count += 1
+
+            print(f"🎯 Final saved reps: {rep_count}")
+
+
+# ============================
 if __name__ == "__main__":
     root = Path(__file__).resolve().parents[2]
 
-    preprocess_dataset(
-        root / "dataset" / "elbow_flexion",
-        root / "processed"
-    )
+    dataset_dir = root / "dataset" / "elbow_flexion"
+    processed_dir = root / "processed_debug"
+
+    preprocess_dataset(dataset_dir, processed_dir)

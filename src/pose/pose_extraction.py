@@ -38,8 +38,13 @@ def extract_frame_landmarks(frame, pose) -> Tuple[Optional[Dict[str, float]], ob
     return _landmark_row(results.pose_landmarks), results
 
 
-def extract_video_landmarks(video_path: str | Path) -> List[Dict[str, float]]:
-    """Extract one complete 33-landmark row per readable video frame."""
+def extract_video_landmarks(
+    video_path: str | Path,
+    frame_stride: int = 1,
+) -> List[Dict[str, float]]:
+    """Extract pose landmarks at a fixed frame stride from a readable video."""
+    if frame_stride < 1:
+        raise ValueError("frame_stride must be at least 1")
     video = cv2.VideoCapture(str(video_path))
     if not video.isOpened():
         raise ValueError(f"Unable to open video: {video_path}")
@@ -50,12 +55,21 @@ def extract_video_landmarks(video_path: str | Path) -> List[Dict[str, float]]:
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as pose:
+        frame_index = 0
         while True:
-            success, frame = video.read()
+            success = video.grab()
             if not success:
                 break
+            if frame_index % frame_stride:
+                frame_index += 1
+                continue
+            success, frame = video.retrieve()
+            if not success:
+                frame_index += 1
+                continue
             row, _ = extract_frame_landmarks(frame, pose)
             rows.append(row or _empty_landmark_row())
+            frame_index += 1
     video.release()
     if not rows:
         raise ValueError(f"Video contains no readable frames: {video_path}")
