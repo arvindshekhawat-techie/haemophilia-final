@@ -1,0 +1,50 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+venv310/
+.venv/
+
+# Dataset and generated data
+dataset/
+features/
+processed/
+
+# NumPy generated files
+
+*.npz
+
+# Generated outputs
+outputs/
+results/
+runs/
+*.log
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Images
+*.jpg
+*.jpeg
+*.png
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
