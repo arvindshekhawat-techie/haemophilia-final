@@ -8,9 +8,9 @@ venv310/
 .venv/
 
 # Dataset and generated data
-dataset/
-features/
-processed/
+/dataset/
+/features/
+/processed/
 
 # NumPy generated files
 
